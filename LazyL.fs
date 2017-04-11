@@ -172,28 +172,34 @@ let eval_tests =
     print_value (eval (parse @"(\x -> (\y -> x)) 'a' 'b';;"))
     printfn "should be: 'a'"
 
+let safe_run th =
+  try
+    th ()
+  with
+  | VarOutOfScope v -> printfn "the variable %s was used out of scope" v
+  | AppliedNonFunction n -> printfn "applied %s as a function" n
+  | NotImplemented -> printfn "used a function that isn't implemented."
+  | ParseError -> printfn "could not parse the input."
+  | LexError -> printfn "could not lex the input!"
+
 let rec repl () =
   try
-    printf "> "
-    let tm = parse (System.Console.ReadLine())
-    in
-      print_value (eval tm);
-      repl ()
+    safe_run (fun () ->
+              printf "> "
+              let tm = parse (System.Console.ReadLine())
+              in print_value (eval tm))
+    repl ()
   with
   | AbortInterpreter -> ()
-  | VarOutOfScope v -> printfn "the variable %s was used out of scope" v ; repl ()
-  | AppliedNonFunction n -> printfn "applied %s as a function" n ; repl ()
-  | NotImplemented -> printfn "used a function that isn't implemented." ; repl ()
-  | ParseError -> printfn "could not parse the input." ; repl ()
-  | LexError -> printfn "could not lex the input!" ; repl ()
+
 
 
 let evalstream (instream : System.IO.StreamReader) = print_value (eval (parse (instream.ReadToEnd())))
 
 [<EntryPoint>]
 let main argv =
-  parse_tests
-  eval_tests
+  safe_run (fun () -> parse_tests)
+  safe_run (fun () -> eval_tests)
   if Array.length argv > 0 then let instream = new System.IO.StreamReader(argv.[0]) in evalstream instream ; instream.Close() else ()
   repl ()
   0
