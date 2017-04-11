@@ -5,7 +5,8 @@ let charlist_string (charlist : char list) = List.foldBack (fun x y -> string x 
 
 type Term =
     Var of string
-    | Abs of string * Term
+    | AbsMany of string list * Term
+    | AbsOne of string * Term
     | App of Term * Term
     | Seq
     | TChar of char
@@ -52,7 +53,7 @@ let lex s = let s1 = List.ofSeq s in
                                          | otherwise -> raise LexError
                    in lexh s1 []
 
-type ParseFragment = PLex of Lexeme | PTerm of Term
+type ParseFragment = PLex of Lexeme | PTerm of Term | BinderList of string list
 
 exception ParseError
 
@@ -62,7 +63,7 @@ type ParseState = S0 | S1 | S2 | S3
 // S0: need some kind of term
 // S2: have a fragment that could already be a complete term
 // S1: just read a backslash, need a binder
-// S3: just read a binder, need an arrow
+// S3: just read a binder, need another binder or an arrow
 
 let rec parseh state stack input =
   let try_app t cs = match stack with
@@ -80,17 +81,17 @@ let rec parseh state stack input =
                | (S0,Token t) -> parseh S2 (PTerm (Var t) :: stack) cs
                | (S0,TUnit) -> parseh S2 (PTerm Unit :: stack) cs
                | (S0,LChar c) -> parseh S2 (PTerm (TChar c) :: stack) cs
-               | (S1,Token t) -> parseh S3 (PLex (Token t) :: stack) cs
+               | (S1,Token t) -> parseh S3 (BinderList [t] :: stack) cs
                | (S2,LParen) -> parseh S0 (PLex LParen :: stack) cs
                | (S2,RParen) -> match stack with
                                 | PTerm t2 :: PLex LParen :: PTerm t1 :: bs -> parseh S2 (PTerm (App(t1,t2)) :: bs) cs
                                 | PTerm t :: PLex LParen :: bs -> parseh S2 (PTerm t :: bs) cs
                                 | PTerm t2 :: PTerm t1 :: bs -> parseh S2 (PTerm (App (t1,t2)) :: bs) (c::cs)
-                                | PTerm t :: PLex Arrow :: PLex (Token v) :: PLex Backslash :: bs -> parseh S2 (PTerm (Abs (v,t)) :: bs) (c::cs)
+                                | PTerm t :: PLex Arrow :: BinderList bns :: PLex Backslash :: bs -> parseh S2 (PTerm (AbsMany (List.rev bns,t)) :: bs) (c::cs)
                                 | otherwise -> raise ParseError
                | (S2,End) -> match stack with
                              | PTerm t2 :: PTerm t1 :: bs -> parseh S2 (PTerm (App (t1,t2)) :: bs) (c::cs)
-                             | PTerm t :: PLex Arrow :: PLex (Token v) :: PLex Backslash :: bs -> parseh S2 ((PTerm (Abs (v,t))) :: bs) (c::cs)
+                             | PTerm t :: PLex Arrow :: BinderList bns :: PLex Backslash :: bs -> parseh S2 ((PTerm (AbsMany (List.rev bns,t))) :: bs) (c::cs)
                              | PTerm t :: [] -> t
                              | otherwise -> raise ParseError
                | (S2,Token "putch") -> try_app Putch cs
@@ -99,6 +100,9 @@ let rec parseh state stack input =
                | (S2,Token t) -> try_app (Var t) cs
                | (S2,TUnit) -> try_app Unit cs
                | (S2,LChar c) -> try_app (TChar c) cs
+               | (S3,Token t) -> match stack with
+                                             | BinderList ts :: ss -> parseh S3 (BinderList (t::ts) :: ss) cs
+                                             | otherwise -> raise ParseError
                | (S3,Arrow) -> parseh S0 (PLex Arrow :: stack) cs
                | otherwise -> raise ParseError
 
@@ -109,7 +113,8 @@ let parse s = parseh S0 [] (lex s)
 (* pprint : Term -> String *)
 let rec pprint = function
                  | Var s -> s
-                 | Abs (s,t) -> "(\\" + s + " -> " + pprint t + ")"
+                 | AbsMany (bns,t) -> "(\\" + (List.foldBack (fun x y -> x + y) bns "") + " -> " + pprint t + ")"
+                 | AbsOne (b,t) -> "(\\" + b + " -> " + pprint t + ")"
                  | App (e1,e2) -> "(" + pprint e1 + " " + pprint e2 + ")"
                  | Seq -> "seq"
                  | Unit -> "()"
@@ -130,13 +135,33 @@ let print_value e = match e with
 
 exception AppliedNonFunction of string
 exception NotImplemented
+exception Sugar
 exception VarOutOfScope of string
 exception AbortInterpreter
+exception EmptyBinderList
+
+let rec desugar_absmany =
+  function
+  | AbsMany ([],t) -> raise EmptyBinderList
+  | AbsMany (bn::[],t) -> AbsOne (bn, desugar_absmany t)
+  | AbsMany (bn::bns,t) -> AbsOne (bn, desugar_absmany (AbsMany (bns,t)))
+  | AbsOne (bn,t) -> AbsOne (bn, desugar_absmany t)
+  | Var v -> Var v
+  | App (t1,t2) -> App (desugar_absmany t1, desugar_absmany t2)
+  | Seq -> Seq
+  | TChar c -> TChar c
+  | Putch -> Putch
+  | Abort -> Abort
+  | Unit -> Unit
+
+// desugar_absmany is the only desugaring pass for now
+let desugar = desugar_absmany
 
 let rec eval_e t env =
   match t with
   | Var v -> match env v with | Thunk th -> th()
-  | Abs (v0,b) -> Funct (fun x -> eval_e b (fun v1 -> if v0 = v1 then x else env v1))
+  | AbsOne (v0,b) -> Funct (fun x -> eval_e b (fun v1 -> if v0 = v1 then x else env v1))
+  | AbsMany (bns,t) -> raise Sugar
   | App (t1,t2) ->
     match eval_e t1 env with
     | Funct f -> f (Thunk (fun () -> eval_e t2 env))
@@ -151,7 +176,7 @@ let rec eval_e t env =
   | Abort -> Funct (fun x -> raise AbortInterpreter)
   | Unit -> EUnit
 
-let eval t = eval_e t (fun v -> raise (VarOutOfScope v))
+let eval t = eval_e (desugar t) (fun v -> raise (VarOutOfScope v))
 
 let pp s = pprint (parse s)
 
@@ -181,6 +206,8 @@ let safe_run th =
   | NotImplemented -> printfn "used a function that isn't implemented."
   | ParseError -> printfn "could not parse the input."
   | LexError -> printfn "could not lex the input!"
+  | Sugar -> printfn "attempted to evaluated a source tree that wasn't desugared"
+  | EmptyBinderList -> printfn "attempted to process a lambda with an empty binder list"
 
 let rec repl () =
   try
